@@ -94,7 +94,7 @@ module.exports = async (req, res) => {
       if (!results.length) continue;
 
       const match = bestMatch(results, title, artist);
-      if (!match || match.sc < 30) continue;
+      if (!match || match.sc < 60) continue;
 
       const audioUrl = match.r.url.replace(/^http:\/\//i, "https://");
       return res.json({ success: true, url: audioUrl, matched: match.r.name, score: match.sc });
