@@ -13,6 +13,10 @@ async function fetchWithTimeout(url, options = {}, ms = 10000) {
   }
 }
 
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
 function clean(s = "") {
   return s.toLowerCase()
     .replace(/[^\w\s]/g, " ")
@@ -22,7 +26,6 @@ function clean(s = "") {
 
 /* ─────────────────────────────────────────────
    LEVENSHTEIN DISTANCE — Fuzzy matching for typos
-   "nirvar" vs "nirvair" → distance 1 (close match)
 ───────────────────────────────────────────── */
 function levenshtein(a, b) {
   if (!a.length) return b.length;
@@ -46,7 +49,6 @@ function levenshtein(a, b) {
   return matrix[b.length][a.length];
 }
 
-/* Similarity 0-1 (1 = perfect match) */
 function similarity(a, b) {
   if (!a || !b) return 0;
   const maxLen = Math.max(a.length, b.length);
@@ -55,7 +57,7 @@ function similarity(a, b) {
 }
 
 /* ─────────────────────────────────────────────
-   BEST MATCH — with fuzzy + word matching
+   BEST MATCH — fuzzy + word matching
 ───────────────────────────────────────────── */
 function bestMatch(list, title, artist, album) {
   const tT = clean(title);
@@ -71,19 +73,17 @@ function bestMatch(list, title, artist, album) {
     let sc = 0;
     const rTMain = rT.replace(/\(from[^)]*\)/gi, "").trim();
 
-    /* ── Title Score (fuzzy + exact) ─────── */
+    /* Title Score */
     if (rTMain === tTMain) sc += 100;
     else if (rT === tT) sc += 100;
     else if (rT.includes(tTMain)) sc += 75;
     else if (tTMain.includes(rTMain)) sc += 55;
     else {
-      // Fuzzy match (typo tolerance)
       const sim = similarity(rTMain, tTMain);
-      if (sim > 0.8) sc += 80;       // very close (1-2 typos)
-      else if (sim > 0.6) sc += 50;  // somewhat close
-      else if (sim > 0.4) sc += 25;  // weak match
+      if (sim > 0.8) sc += 80;
+      else if (sim > 0.6) sc += 50;
+      else if (sim > 0.4) sc += 25;
 
-      // Word-by-word matching
       const tw = tTMain.split(" ").filter(w => w.length > 2);
       const rw = rTMain.split(" ").filter(w => w.length > 2);
       const matches = tw.filter(w =>
@@ -93,7 +93,7 @@ function bestMatch(list, title, artist, album) {
       if (matches.length < tw.length / 2 && sim < 0.5) sc -= 15;
     }
 
-    /* ── Artist Score (fuzzy + exact) ─────── */
+    /* Artist Score */
     if (tA) {
       if (rA === tA) sc += 50;
       else if (rA.includes(tA)) sc += 38;
@@ -112,7 +112,7 @@ function bestMatch(list, title, artist, album) {
       }
     }
 
-    /* ── Album Number Score (sequels) ─────── */
+    /* Album Number Score (sequels) */
     if (albumNum) {
       const rAlNum = (rAl.match(/\d+/) || [])[0] || "";
       const rTNum = (rT.match(/\d+/) || [])[0] || "";
@@ -134,7 +134,84 @@ function bestMatch(list, title, artist, album) {
 }
 
 /* ─────────────────────────────────────────────
-   API HANDLER
+   ✅ Try one API with retry on rate limit
+───────────────────────────────────────────── */
+async function tryApi(apiUrl, retries = 2) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const r = await fetchWithTimeout(
+        apiUrl,
+        { headers: { "User-Agent": "Mozilla/5.0" } },
+        8000
+      );
+
+      // ✅ Handle rate limit (429) specifically
+      if (r.status === 429) {
+        console.log(`   ⚠️ 429 rate limit (attempt ${attempt})`);
+        if (attempt < retries) {
+          await sleep(800 * attempt);
+          continue;
+        }
+        return null;
+      }
+
+      if (!r.ok) {
+        console.log(`   HTTP ${r.status}`);
+        return null;
+      }
+
+      return await r.json();
+    } catch (e) {
+      console.log(`   API error (attempt ${attempt}): ${e.message}`);
+      if (attempt < retries) await sleep(500);
+    }
+  }
+  return null;
+}
+
+/* ─────────────────────────────────────────────
+   ✅ Extract songs from API response (handles all formats)
+───────────────────────────────────────────── */
+function extractSongs(data) {
+  let results = [];
+
+  // Format 1: Array
+  if (Array.isArray(data)) {
+    results = data.map(s => ({
+      name:   s.song || s.name || "",
+      artist: s.singers || s.artist || "",
+      album:  s.album || "",
+      url:    s.media_url || s.url || null,
+    })).filter(s => s.name && s.url);
+  } else {
+    // Format 2 & 3: Object with results
+    const songs = data?.data?.results || data?.results || [];
+    results = songs.map(s => {
+      let url = null;
+      if (Array.isArray(s.downloadUrl)) {
+        const best = s.downloadUrl.find(d => d.quality === "320kbps")
+                  || s.downloadUrl.find(d => d.quality === "160kbps")
+                  || s.downloadUrl[s.downloadUrl.length - 1];
+        url = best?.url || null;
+      } else {
+        url = s.downloadUrl || s.url || null;
+      }
+      return {
+        name: s.name || s.song || "",
+        artist: Array.isArray(s.artists?.primary)
+                  ? s.artists.primary.map(a => a.name).join(", ")
+                  : s.primaryArtists || s.singers || "",
+        album: s.album?.name || s.album || "",
+        url,
+      };
+    }).filter(s => s.name && s.url);
+  }
+
+  return results;
+}
+
+/* ─────────────────────────────────────────────
+   API HANDLER — Optimized to avoid rate limits
 ───────────────────────────────────────────── */
 module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -146,101 +223,99 @@ module.exports = async (req, res) => {
 
   console.log(`\n🎵 Saavn: "${title}" — ${artist || "?"} | Album: "${album || "?"}"`);
 
-  // ✅ Multiple search strategies (more queries = more chances)
+  // ✅ Fewer, smarter queries (3 instead of 5 — less rate limit risk)
   const searchQueries = [
-    `${title} ${artist || ""} ${album || ""}`.trim(),
-    `${title} ${artist || ""}`.trim(),
-    `${artist || ""} ${title}`.trim(),
-    title.trim(),
-    `${title.split(" ").slice(0, 3).join(" ")} ${artist || ""}`.trim(),
+    `${title} ${artist || ""}`.trim(),         // Most specific
+    `${artist || ""} ${title}`.trim(),         // Artist first
+    title.trim(),                              // Title only (fallback)
   ];
 
   const uniqueQueries = [...new Set(searchQueries)].filter(q => q);
 
+  // ✅ Best results collected across all queries
+  let bestOverallMatch = null;
+  let bestOverallScore = -1;
+
+  // ✅ APIs in priority order (most reliable first)
+  const APIS = [
+    "https://saavn.dev/api/search/songs",
+    "https://jiosaavn-api-privatecvc2.vercel.app/search/songs",
+    "https://saavnapi-nine.vercel.app/result/",
+  ];
+
   for (const query of uniqueQueries) {
     console.log(`\n   🔍 Query: "${query}"`);
 
-    const APIS = [
-      `https://saavnapi-nine.vercel.app/result/?query=${encodeURIComponent(query)}`,
-      `https://jiosaavn-api-privatecvc2.vercel.app/search/songs?query=${encodeURIComponent(query)}&page=1&limit=15`,
-      `https://saavn.dev/api/search/songs?query=${encodeURIComponent(query)}&page=1&limit=15`,
-    ];
-
-    for (const apiUrl of APIS) {
-      try {
-        console.log("   API: " + apiUrl.substring(0, 60) + "...");
-        const r = await fetchWithTimeout(
-          apiUrl,
-          { headers: { "User-Agent": "Mozilla/5.0" } },
-          8000
-        );
-        if (!r.ok) continue;
-        const data = await r.json();
-
-        let results = [];
-
-        // API 1 - Array format
-        if (Array.isArray(data)) {
-          results = data.map(s => ({
-            name: s.song || s.name || "",
-            artist: s.singers || s.artist || "",
-            album: s.album || "",
-            url: s.media_url || s.url || null,
-          })).filter(s => s.name && s.url);
-        } else {
-          // API 2 & 3 - Object format
-          const songs = data?.data?.results || data?.results || [];
-          results = songs.map(s => {
-            let url = null;
-            if (Array.isArray(s.downloadUrl)) {
-              const best = s.downloadUrl.find(d => d.quality === "320kbps")
-                        || s.downloadUrl.find(d => d.quality === "160kbps")
-                        || s.downloadUrl[s.downloadUrl.length - 1];
-              url = best?.url || null;
-            } else {
-              url = s.downloadUrl || s.url || null;
-            }
-            return {
-              name: s.name || s.song || "",
-              artist: Array.isArray(s.artists?.primary)
-                        ? s.artists.primary.map(a => a.name).join(", ")
-                        : s.primaryArtists || s.singers || "",
-              album: s.album?.name || s.album || "",
-              url,
-            };
-          }).filter(s => s.name && s.url);
-        }
-
-        console.log(`   Results: ${results.length}`);
-        if (!results.length) continue;
-
-        const match = bestMatch(results, title, artist, album);
-
-        // ✅ Lowered threshold (more matches allowed for fuzzy)
-        const minScore = title.length <= 5 ? 35 : 50;
-
-        if (!match || match.sc < minScore) {
-          console.log(`   ❌ Score too low: ${match?.sc} (need ${minScore})`);
-          continue;
-        }
-
-        const audioUrl = match.r.url.replace(/^http:\/\//i, "https://");
-        console.log(`   ✅ FOUND: "${match.r.name}" score=${match.sc}`);
-        return res.json({
-          success: true,
-          url: audioUrl,
-          matched: match.r.name,
-          artist: match.r.artist,
-          score: match.sc,
-        });
-
-      } catch (e) {
-        console.log("   API failed: " + e.message);
-        continue;
+    for (const baseUrl of APIS) {
+      // Build URL based on API format
+      let apiUrl;
+      if (baseUrl.includes("saavnapi-nine")) {
+        apiUrl = `${baseUrl}?query=${encodeURIComponent(query)}`;
+      } else {
+        apiUrl = `${baseUrl}?query=${encodeURIComponent(query)}&page=1&limit=15`;
       }
+
+      console.log("   API: " + baseUrl.substring(0, 50) + "...");
+
+      const data = await tryApi(apiUrl, 2);
+      if (!data) continue;
+
+      const results = extractSongs(data);
+      console.log(`   Results: ${results.length}`);
+      if (!results.length) continue;
+
+      const match = bestMatch(results, title, artist, album);
+
+      // ✅ Smart threshold — lower for short titles
+      const minScore = title.length <= 5 ? 35 : 50;
+
+      if (match && match.sc >= minScore) {
+        // ✅ Track best across all queries (might find better one later)
+        if (match.sc > bestOverallScore) {
+          bestOverallMatch = match;
+          bestOverallScore = match.sc;
+        }
+
+        // ✅ If excellent match, return immediately (don't waste more API calls)
+        if (match.sc >= 100) {
+          const audioUrl = match.r.url.replace(/^http:\/\//i, "https://");
+          console.log(`   ✅ EXCELLENT MATCH: "${match.r.name}" score=${match.sc}`);
+          return res.json({
+            success: true,
+            url: audioUrl,
+            matched: match.r.name,
+            artist: match.r.artist,
+            score: match.sc,
+          });
+        }
+      } else {
+        console.log(`   ❌ Score too low: ${match?.sc || 0} (need ${minScore})`);
+      }
+
+      // ✅ Small delay between API calls (avoid rate limit)
+      await sleep(150);
     }
+
+    // ✅ If we found a decent match, no need to try more queries
+    if (bestOverallScore >= 70) break;
+
+    // Small delay between queries
+    await sleep(200);
+  }
+
+  // ✅ Return best match found across all queries
+  if (bestOverallMatch && bestOverallScore >= (title.length <= 5 ? 35 : 50)) {
+    const audioUrl = bestOverallMatch.r.url.replace(/^http:\/\//i, "https://");
+    console.log(`   ✅ BEST MATCH: "${bestOverallMatch.r.name}" score=${bestOverallScore}`);
+    return res.json({
+      success: true,
+      url: audioUrl,
+      matched: bestOverallMatch.r.name,
+      artist: bestOverallMatch.r.artist,
+      score: bestOverallScore,
+    });
   }
 
   console.log("   ❌ Not found after all strategies");
-  return res.json({ success: false, url: null, reason: "Not found" });
+  return res.json({ success: false, url: null, reason: "Not found on Saavn" });
 };
